@@ -1449,6 +1449,15 @@ class FavourManagerTool(Star):
         member = self.group_identity_store.get_member(self._group_identity_scope_id(event), str(user_id))
         return self._member_recall_name(member) if member else ""
 
+    def _role_display(self, role: str) -> str:
+        return {
+            "owner": "群主",
+            "admin": "群管理员",
+            "member": "普通群员",
+            "private": "私聊",
+            "unknown": "未知",
+        }.get(normalize_role(role), str(role or "未知"))
+
     def _xml_escape(self, value) -> str:
         return (
             str(value or "")
@@ -2193,6 +2202,8 @@ class FavourManagerTool(Star):
     @filter.command("查询好感度", alias={'查好感度', '好感度查询', '查看好感度', '好感度'})
     async def query_favour(self, event: AstrMessageEvent, target: str = ""):
         """查询自己或他人的好感度"""
+        if _is_group_event(event):
+            self._touch_group_identity(event)
         target_uid = self._get_target_uid(event, target) or str(event.get_sender_id())
         is_self_query = target_uid == str(event.get_sender_id())
         
@@ -2237,8 +2248,11 @@ class FavourManagerTool(Star):
         uniq = " (唯一)" if record and record.is_unique else ""
         
         name = await self._get_user_display_name(event, target_uid)
+        group_role = self._sender_group_role(event, target_uid)
+        if group_role == "unknown" and _is_group_event(event):
+            group_role = "member"
         
-        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}\n🔗 关系：{rel}{uniq}"
+        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}\n🔗 关系：{rel}{uniq}\n👥 群身份：{self._role_display(group_role)}"
         yield event.plain_result(msg)
 
     @filter.command("查询当前好感度", alias={'查当前好感度', '查询本群好感度', '查本群好感度', '查群好感度', '查询群好感度', '当前好感度', '本群好感度', '群好感度'})
