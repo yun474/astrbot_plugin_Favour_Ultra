@@ -84,6 +84,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "private_normal_user": True, # 私聊普通用户可否查询
     },
 
+    # 群身份与成员目录配置
+    "group_identity": {
+        "enabled": True,
+        # 新群首次触达时自动尝试拉取群成员列表
+        "auto_fetch_member_directory": True,
+        # 注入和查询时名称优先级：card=群名片优先，nickname=QQ昵称优先
+        "member_name_preference": "card",
+        # 机器人账号 ID，留空时尝试从事件/平台对象自动识别
+        "bot_self_user_id": "",
+    },
+
     # 高级配置
     "advanced_config": {
         "admin_default_favour": 50,
@@ -289,6 +300,18 @@ class PluginConfigManager:
             for k in new_config["query_permission"]:
                 if k in old["query_permission"]:
                     new_config["query_permission"][k] = old["query_permission"][k]
+
+        # 群身份与成员目录配置
+        if "group_identity" in old and isinstance(old["group_identity"], dict):
+            for k in new_config["group_identity"]:
+                if k in old["group_identity"]:
+                    new_config["group_identity"][k] = old["group_identity"][k]
+        if "群成员目录_初始化获取" in old:
+            new_config["group_identity"]["auto_fetch_member_directory"] = old["群成员目录_初始化获取"]
+        if "群成员目录_召回名称优先级" in old:
+            new_config["group_identity"]["member_name_preference"] = old["群成员目录_召回名称优先级"]
+        if "bot_self_user_id" in old:
+            new_config["group_identity"]["bot_self_user_id"] = old["bot_self_user_id"]
 
         # 高级配置
         if "advanced_config" in old:

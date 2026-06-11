@@ -24,8 +24,59 @@ from .utils import is_valid_userid
 from .permissions import PermLevel, PermissionManager
 from .storage import FavourDBManager, FavourRecord
 from .config_manager import PluginConfigManager
+from .group_identity import GroupIdentityStore, normalize_role, normalize_text
 
 PLUGIN_NAME = "astrbot_plugin_Favour_Ultra"
+
+
+def _group_id(event: AstrMessageEvent) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    group_id = getattr(message_obj, "group_id", "") if message_obj else ""
+    if not group_id:
+        try:
+            group_id = event.get_group_id()
+        except Exception:
+            group_id = ""
+    return str(group_id or "")
+
+
+def _group_name(event: AstrMessageEvent) -> str:
+    group = getattr(getattr(event, "message_obj", None), "group", None)
+    return str(getattr(group, "group_name", "") or "")
+
+
+def _is_group_event(event: AstrMessageEvent) -> bool:
+    return bool(_group_id(event))
+
+
+def _sender_name(event: AstrMessageEvent) -> str:
+    return str(event.get_sender_name() or event.get_sender_id() or "未知成员")
+
+
+def _sender_id(event: AstrMessageEvent) -> str:
+    return str(event.get_sender_id() or _sender_name(event) or "unknown")
+
+
+def _bot_id(event: AstrMessageEvent) -> str:
+    for attr_name in ("get_self_id", "get_bot_id"):
+        attr = getattr(event, attr_name, None)
+        if callable(attr):
+            try:
+                value = attr()
+            except Exception:
+                value = ""
+            if value:
+                return str(value)
+    message_obj = getattr(event, "message_obj", None)
+    bot = getattr(event, "bot", None)
+    for owner in (event, message_obj, bot):
+        if not owner:
+            continue
+        for attr_name in ("self_id", "bot_id", "account_id", "uin", "id"):
+            value = getattr(owner, attr_name, "")
+            if value:
+                return str(value)
+    return ""
 
 class FavourManagerTool(Star):
     def __init__(self, context: Context, config: Optional[Dict] = None):
@@ -100,6 +151,9 @@ class FavourManagerTool(Star):
         query_perm = self.config.get("query_permission", {})
         self.query_group_normal = query_perm.get("group_normal_user", True)
         self.query_private_normal = query_perm.get("private_normal_user", True)
+
+        # 群身份/成员目录配置
+        self._load_group_identity_config()
         
         # 黑名单（被自动拉黑的用户 session 组合）
         self.auto_blacklisted: Set[str] = set()
@@ -122,6 +176,9 @@ class FavourManagerTool(Star):
         # 数据库初始化
         self.data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "astrbot_plugin_favour_ultra"
         self.db_manager = FavourDBManager(self.data_dir, self.min_favour_value, self.max_favour_value)
+        self.group_identity_store = GroupIdentityStore(self.data_dir)
+        self.group_identity_store.load()
+        self._last_group_apis: Dict[str, object] = {}
         
         # 异步初始化数据库和迁移数据
         asyncio.create_task(self._init_storage())
@@ -261,6 +318,14 @@ class FavourManagerTool(Star):
                 for k in framework_config["cold_violence_config"]:
                     if k in self.config["cold_violence_config"]:
                         self.config["cold_violence_config"][k] = framework_config["cold_violence_config"][k]
+
+            if "group_identity" in framework_config:
+                for k in framework_config["group_identity"]:
+                    if k in self.config["group_identity"]:
+                        self.config["group_identity"][k] = framework_config["group_identity"][k]
+            for old_key in ("群成员目录_初始化获取", "群成员目录_召回名称优先级", "bot_self_user_id"):
+                if old_key in framework_config:
+                    self.config[old_key] = framework_config[old_key]
             
             self.config_mgr._config = self.config
             self.config_mgr.save()
@@ -831,6 +896,37 @@ class FavourManagerTool(Star):
             logger.error(f"数据管理操作失败: {e}\n{traceback.format_exc()}")
             return jsonify({"success": False, "error": str(e)}), 500
 
+    def _config_bool(self, value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "开启", "是"}
+        return bool(value)
+
+    def _load_group_identity_config(self) -> None:
+        group_conf = self.config.get("group_identity", {})
+        if not isinstance(group_conf, dict):
+            group_conf = {}
+        self.group_identity_enabled = self._config_bool(group_conf.get("enabled"), True)
+        self.group_identity_auto_fetch = self._config_bool(
+            group_conf.get(
+                "auto_fetch_member_directory",
+                self.config.get("群成员目录_初始化获取", True),
+            ),
+            True,
+        )
+        self.group_identity_name_preference = str(
+            group_conf.get(
+                "member_name_preference",
+                self.config.get("群成员目录_召回名称优先级", "card"),
+            )
+            or "card"
+        ).strip()
+        self.bot_self_user_id = str(
+            group_conf.get("bot_self_user_id", self.config.get("bot_self_user_id", ""))
+            or ""
+        ).strip()
+
     def _reload_config_from_manager(self) -> None:
         """从 PluginConfigManager 重新加载配置到实例属性。"""
         cfg = self.config_mgr.config
@@ -884,6 +980,8 @@ class FavourManagerTool(Star):
         qp = cfg.get("query_permission", {})
         self.query_group_normal = qp.get("group_normal_user", True)
         self.query_private_normal = qp.get("private_normal_user", True)
+
+        self._load_group_identity_config()
 
         self._validate_config()
         
@@ -959,11 +1057,17 @@ class FavourManagerTool(Star):
             # 先尝试作为纯 ID
             if is_valid_userid(full_text):
                 return full_text
+            resolved_uid = self._resolve_group_member_user_id(event, full_text)
+            if resolved_uid:
+                return resolved_uid
             
             # 如果 text_arg 本身是有效 ID（不含空格场景）
             cleaned_arg = text_arg.strip()
             if is_valid_userid(cleaned_arg):
                 return cleaned_arg
+            resolved_uid = self._resolve_group_member_user_id(event, cleaned_arg)
+            if resolved_uid:
+                return resolved_uid
             
         return None
 
@@ -971,6 +1075,415 @@ class FavourManagerTool(Star):
         if self.is_global_favour:
             return "global"
         return event.unified_msg_origin
+
+    def _group_identity_scope_id(self, event: AstrMessageEvent) -> str:
+        if _is_group_event(event):
+            return _group_id(event) or event.unified_msg_origin
+        return event.unified_msg_origin
+
+    def _session_label(self, event: AstrMessageEvent) -> str:
+        group_name = _group_name(event)
+        group_id = _group_id(event)
+        if _is_group_event(event):
+            if group_name:
+                return f"群聊「{group_name}」({group_id})"
+            return f"群聊({group_id})"
+        return f"私聊({_sender_id(event)})"
+
+    def _touch_group_identity(self, event: AstrMessageEvent):
+        if not getattr(self, "group_identity_enabled", True):
+            return None
+        scope_id = self._group_identity_scope_id(event)
+        if event.get_extra("favour_group_identity_touched", False):
+            return self.group_identity_store.groups.get(scope_id)
+
+        kind = "group" if _is_group_event(event) else "private"
+        group = self.group_identity_store.touch_group(
+            group_id=scope_id,
+            name=_group_name(event) or self._session_label(event),
+            session_id=event.unified_msg_origin,
+            kind=kind,
+        )
+        if kind == "group":
+            role, role_evidence = self._resolve_sender_group_role(event)
+            api = self._platform_api_from_event(event)
+            if api:
+                self._last_group_apis[scope_id] = api
+            self.group_identity_store.upsert_group_member(
+                group_id=scope_id,
+                user_id=_sender_id(event),
+                display_name=_sender_name(event),
+                role=role or "member",
+                source=role_evidence or "event message",
+            )
+            if role == "owner" and not group.owner_user_id:
+                self.group_identity_store.set_group_owner(
+                    scope_id,
+                    _sender_id(event),
+                    _sender_name(event),
+                    role_evidence or "group role initialization",
+                )
+            if not group.member_directory_updated_at and self.group_identity_auto_fetch:
+                self._schedule_group_directory_refresh(event)
+        event.set_extra("favour_group_identity_touched", True)
+        return group
+
+    def _nested_value(self, root: Any, path: Tuple[str, ...]) -> Any:
+        current = root
+        for key in path:
+            if current is None:
+                return None
+            current = current.get(key) if isinstance(current, dict) else getattr(current, key, None)
+        return current
+
+    def _extract_platform_sender_role(self, event: AstrMessageEvent) -> Tuple[str, str]:
+        role_paths = (
+            ("message_obj", "sender", "role"),
+            ("message_obj", "sender_info", "role"),
+            ("message_obj", "raw_message", "sender", "role"),
+            ("message_obj", "raw", "sender", "role"),
+            ("message_obj", "message_event", "sender", "role"),
+            ("message_obj", "message_event", "raw_message", "sender", "role"),
+            ("message_obj", "message_event", "raw", "sender", "role"),
+        )
+        for path in role_paths:
+            role_value = normalize_role(self._nested_value(event, path))
+            if role_value in {"owner", "admin", "member"}:
+                return role_value, ".".join(path)
+        return "", ""
+
+    def _resolve_sender_group_role(self, event: AstrMessageEvent) -> Tuple[str, str]:
+        platform_role, evidence = self._extract_platform_sender_role(event)
+        if platform_role:
+            return platform_role, evidence
+        for attr_name, role in (("is_group_owner", "owner"), ("is_group_admin", "admin")):
+            attr = getattr(event, attr_name, None)
+            try:
+                matched = bool(attr()) if callable(attr) else bool(attr)
+            except Exception:
+                matched = False
+            if matched:
+                return role, f"event.{attr_name}"
+        return "member", "group message initialization"
+
+    def _sender_group_role(self, event: AstrMessageEvent, user_id: str = "") -> str:
+        if not _is_group_event(event):
+            return "private"
+        group_id = self._group_identity_scope_id(event)
+        target_id = str(user_id or _sender_id(event))
+        member = self.group_identity_store.get_member(group_id, target_id)
+        if member and member.active:
+            return member.role or "member"
+        if target_id == _sender_id(event):
+            return self._resolve_sender_group_role(event)[0]
+        return "unknown"
+
+    def _bot_group_role(self, event: AstrMessageEvent) -> str:
+        if not _is_group_event(event):
+            return "private"
+        bot_id = self.bot_self_user_id or _bot_id(event)
+        if not bot_id:
+            return "unknown"
+        group_id = self._group_identity_scope_id(event)
+        group = self.group_identity_store.groups.get(group_id)
+        if group and group.owner_user_id and str(group.owner_user_id) == bot_id:
+            return "owner"
+        member = self.group_identity_store.get_member(group_id, bot_id)
+        if member and member.active:
+            return member.role or "member"
+        return "unknown"
+
+    def _schedule_group_directory_refresh(self, event: AstrMessageEvent) -> None:
+        if event.get_extra("favour_group_directory_refresh_scheduled", False):
+            return
+        event.set_extra("favour_group_directory_refresh_scheduled", True)
+        try:
+            asyncio.create_task(self._refresh_group_directory(event, force=False))
+        except RuntimeError:
+            logger.warning("好感度插件无法调度群成员目录刷新：当前没有运行中的事件循环。")
+
+    async def _refresh_group_directory(
+        self,
+        event: Optional[AstrMessageEvent],
+        force: bool = False,
+        group_id: str = "",
+        api=None,
+        allow_event_fallback: bool = True,
+    ) -> int:
+        if (not event or not _is_group_event(event)) and not group_id:
+            return 0
+        group_id = str(group_id or (self._group_identity_scope_id(event) if event else "")).strip()
+        if not group_id:
+            return 0
+        group = self.group_identity_store.groups.get(group_id)
+        if group and group.member_directory_updated_at and not force:
+            return int(group.member_count or 0)
+        members = await self._fetch_group_member_directory(event, group_id=group_id, api=api)
+        if members:
+            self.group_identity_store.replace_group_members(group_id, members, source="platform")
+            owner = next((item for item in members if normalize_role(item.get("role", "")) == "owner"), None)
+            if owner:
+                self.group_identity_store.set_group_owner(
+                    group_id,
+                    str(owner.get("user_id") or ""),
+                    str(owner.get("display_name") or owner.get("nickname") or owner.get("card") or ""),
+                    "platform member directory",
+                )
+            return len(members)
+        if event and allow_event_fallback:
+            self.group_identity_store.upsert_group_member(
+                group_id=group_id,
+                user_id=_sender_id(event),
+                display_name=_sender_name(event),
+                role=self._resolve_sender_group_role(event)[0],
+                source="event fallback",
+            )
+            self.group_identity_store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
+        group = self.group_identity_store.groups.get(group_id)
+        return int(group.member_count or 0) if group else 0
+
+    async def _fetch_group_member_directory(self, event: Optional[AstrMessageEvent], group_id: str = "", api=None) -> List[dict]:
+        group_id = str(group_id or (_group_id(event) if event else "")).strip()
+        if not group_id:
+            return []
+        items = []
+        for candidate_api in self._platform_api_candidates(event=event, group_id=group_id, preferred=api):
+            raw = await self._call_platform_action_with_api(candidate_api, "get_group_member_list", {"group_id": group_id})
+            data = self._extract_action_data(raw)
+            if isinstance(data, list):
+                items = data
+                self._last_group_apis[group_id] = candidate_api
+                break
+        if not items:
+            return []
+        members = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or item.get("id") or "").strip()
+            if not user_id:
+                continue
+            card = str(item.get("card") or item.get("group_card") or item.get("card_name") or item.get("group_nickname") or "").strip()
+            nickname = str(item.get("nickname") or item.get("nick") or item.get("qq_name") or item.get("name") or "").strip()
+            display_name = self._member_display_name_from_item(item, user_id)
+            members.append(
+                {
+                    "user_id": user_id,
+                    "display_name": display_name,
+                    "card": card,
+                    "nickname": nickname,
+                    "role": normalize_role(item.get("role", "member")),
+                }
+            )
+        return members
+
+    def _platform_api_from_event(self, event: Optional[AstrMessageEvent]):
+        bot = getattr(event, "bot", None) if event else None
+        return self._extract_platform_api(bot)
+
+    def _extract_platform_api(self, obj):
+        queue = [obj] if obj else []
+        seen: Set[int] = set()
+        while queue:
+            current = queue.pop(0)
+            if current is None:
+                continue
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if callable(getattr(current, "call_action", None)):
+                return current
+            api = getattr(current, "api", None)
+            if callable(getattr(api, "call_action", None)):
+                return api
+            for attr_name in ("bot", "client"):
+                child = getattr(current, attr_name, None)
+                if child is not None and id(child) not in seen:
+                    queue.append(child)
+            get_client = getattr(current, "get_client", None)
+            if callable(get_client):
+                try:
+                    client = get_client()
+                    if client is not None and not hasattr(client, "__await__") and id(client) not in seen:
+                        queue.append(client)
+                except Exception as exc:
+                    logger.debug(f"好感度插件获取平台 client 失败: {exc}")
+        return None
+
+    def _platform_api_candidates(self, event: Optional[AstrMessageEvent] = None, group_id: str = "", preferred=None) -> List[Any]:
+        candidates = []
+        seen: Set[int] = set()
+
+        def add_api(value) -> None:
+            api = self._extract_platform_api(value)
+            if not api or not callable(getattr(api, "call_action", None)):
+                return
+            marker = id(api)
+            if marker in seen:
+                return
+            seen.add(marker)
+            candidates.append(api)
+
+        if preferred:
+            add_api(preferred)
+        if group_id:
+            add_api(self._last_group_apis.get(group_id))
+        add_api(self._platform_api_from_event(event))
+        containers = [getattr(self.context, "platform_manager", None), self.context]
+        for container in containers:
+            if not container:
+                continue
+            for attr_name in ("get_insts", "get_platforms", "platform_insts", "platforms", "insts"):
+                try:
+                    value = getattr(container, attr_name, None)
+                    value = value() if callable(value) else value
+                except Exception as exc:
+                    logger.debug(f"好感度插件检查平台容器 `{attr_name}` 失败: {exc}")
+                    continue
+                if value is None or hasattr(value, "__await__"):
+                    continue
+                if isinstance(value, dict):
+                    iterable = value.values()
+                elif isinstance(value, (list, tuple, set)):
+                    iterable = value
+                else:
+                    continue
+                for platform in iterable:
+                    add_api(platform)
+        return candidates
+
+    async def _call_platform_action_with_api(self, api, action: str, params: dict):
+        call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            return None
+        group_id = params.get("group_id")
+        candidates = [params]
+        if isinstance(group_id, str) and group_id.isdigit():
+            converted = dict(params)
+            converted["group_id"] = int(group_id)
+            candidates.append(converted)
+        for candidate in candidates:
+            for mode in ("kwargs", "dict"):
+                try:
+                    if mode == "kwargs":
+                        result = call_action(action, **candidate)
+                    else:
+                        result = call_action(action, candidate)
+                    if hasattr(result, "__await__"):
+                        result = await result
+                    if result is not None:
+                        return result
+                except Exception as exc:
+                    logger.debug(f"好感度插件平台动作 `{action}` 通过 {mode} 调用失败: {exc}")
+        return None
+
+    def _extract_action_data(self, raw):
+        if isinstance(raw, dict):
+            if "data" in raw:
+                return raw["data"]
+            if "retcode" in raw and "result" in raw:
+                return raw["result"]
+        return raw
+
+    def _member_name_preference(self, override: str = "", allow_default: bool = False) -> str:
+        value = normalize_text(override)
+        if not value and allow_default:
+            value = normalize_text(self.group_identity_name_preference or "card")
+        if value in {"nickname", "qq名称", "qq_name", "name"}:
+            return "nickname"
+        return "card"
+
+    def _member_display_name_from_item(self, item: dict, user_id: str) -> str:
+        card = str(item.get("card") or item.get("group_card") or item.get("card_name") or item.get("group_nickname") or "").strip()
+        nickname = str(item.get("nickname") or item.get("nick") or item.get("qq_name") or item.get("name") or "").strip()
+        if self._member_name_preference(allow_default=True) == "nickname":
+            return nickname or card or user_id
+        return card or nickname or user_id
+
+    def _member_recall_name(self, member) -> str:
+        preference = self._member_name_preference(getattr(member, "recall_name_preference", ""), allow_default=True)
+        card = str(getattr(member, "card", "") or "").strip()
+        nickname = str(getattr(member, "nickname", "") or "").strip()
+        display_name = str(getattr(member, "display_name", "") or "").strip()
+        user_id = str(getattr(member, "user_id", "") or "").strip()
+        if preference == "nickname":
+            return nickname or card or display_name or user_id
+        return card or nickname or display_name or user_id
+
+    def _member_search_names(self, member) -> List[str]:
+        return [
+            getattr(member, "user_id", ""),
+            getattr(member, "card", ""),
+            getattr(member, "nickname", ""),
+            getattr(member, "display_name", ""),
+            self._member_recall_name(member),
+        ]
+
+    def _resolve_group_member_user_id(self, event: AstrMessageEvent, name: str) -> str:
+        if not getattr(self, "group_identity_enabled", True) or not _is_group_event(event):
+            return ""
+        needle = normalize_text(str(name or "").strip())
+        if not needle:
+            return ""
+        cq_match = re.search(r"qq=(\d+)", name)
+        if cq_match:
+            return cq_match.group(1)
+        at_match = re.search(r"@(\d+)", name)
+        if at_match:
+            return at_match.group(1)
+        if needle.isdigit():
+            return needle
+        group_id = self._group_identity_scope_id(event)
+        for member in self.group_identity_store.members.values():
+            if member.group_id == group_id and member.active and any(normalize_text(item) == needle for item in self._member_search_names(member)):
+                return member.user_id
+        for member in self.group_identity_store.members.values():
+            if member.group_id == group_id and member.active and any(needle in normalize_text(item) for item in self._member_search_names(member)):
+                return member.user_id
+        return ""
+
+    def _display_name_from_group_identity(self, event: AstrMessageEvent, user_id: str) -> str:
+        if not getattr(self, "group_identity_enabled", True) or not _is_group_event(event):
+            return ""
+        member = self.group_identity_store.get_member(self._group_identity_scope_id(event), str(user_id))
+        return self._member_recall_name(member) if member else ""
+
+    def _xml_escape(self, value) -> str:
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _build_group_identity_context(self, event: AstrMessageEvent, user_id: str) -> str:
+        if not getattr(self, "group_identity_enabled", True):
+            return ""
+        group_id = self._group_identity_scope_id(event)
+        group = self.group_identity_store.groups.get(group_id)
+        group_name = group.name if group else (_group_name(event) or self._session_label(event))
+        member = self.group_identity_store.get_member(group_id, user_id) if _is_group_event(event) else None
+        display_name = self._member_recall_name(member) if member else (_sender_name(event) if user_id == _sender_id(event) else user_id)
+        card = getattr(member, "card", "") if member else ""
+        nickname = getattr(member, "nickname", "") if member else ""
+        user_role = self._sender_group_role(event, user_id)
+        bot_role = self._bot_group_role(event)
+        directory_count = int(group.member_count or 0) if group else 0
+        directory_source = group.member_directory_source if group else ""
+        return f"""
+        <GroupIdentity>
+            <GroupID>{self._xml_escape(group_id)}</GroupID>
+            <GroupName>{self._xml_escape(group_name)}</GroupName>
+            <UserDisplayName>{self._xml_escape(display_name)}</UserDisplayName>
+            <UserGroupCard>{self._xml_escape(card)}</UserGroupCard>
+            <UserQQNickname>{self._xml_escape(nickname)}</UserQQNickname>
+            <UserGroupRole>{self._xml_escape(user_role)}</UserGroupRole>
+            <BotGroupRole>{self._xml_escape(bot_role)}</BotGroupRole>
+            <MemberDirectoryCount>{directory_count}</MemberDirectoryCount>
+            <MemberDirectorySource>{self._xml_escape(directory_source or "event")}</MemberDirectorySource>
+        </GroupIdentity>
+        <GroupIdentityRule>群主/管理员/普通成员是群身份，不等于亲密关系；但回复态度和关系判断必须同时参考 CurrentFavour、CurrentRelationship、UserGroupRole 和 BotGroupRole。</GroupIdentityRule>"""
 
     def _escape_markdown(self, text: str) -> str:
         """转义 Markdown 特殊字符以防止表格错位或渲染错误"""
@@ -991,6 +1504,9 @@ class FavourManagerTool(Star):
         return text
 
     async def _get_user_display_name(self, event: AstrMessageEvent, user_id: str) -> str:
+        cached_name = self._display_name_from_group_identity(event, user_id)
+        if cached_name and cached_name != str(user_id):
+            return cached_name
         try:
             group_id = event.get_group_id()
             if group_id:
@@ -1201,6 +1717,8 @@ class FavourManagerTool(Star):
             if is_synthetic and target_uid:
                 user_id = str(target_uid)
                 logger.debug(f"[搭话管线] 合成事件注入目标用户 {user_id} 的好感度/关系数据。")
+            elif not is_synthetic:
+                self._touch_group_identity(event)
 
             if session_id != "global":
                 if self.allowed_sessions and session_id not in self.allowed_sessions:
@@ -1279,7 +1797,11 @@ class FavourManagerTool(Star):
                     rel_rows = []
                     for r in records:
                         if r.relationship and r.user_id != user_id:
-                            rel_rows.append(f"用户ID:{r.user_id} | 关系:{r.relationship} | 好感度:{r.favour}")
+                            member_name = self._display_name_from_group_identity(event, r.user_id) or r.username or r.user_id
+                            group_role = self._sender_group_role(event, r.user_id)
+                            rel_rows.append(
+                                f"用户ID:{r.user_id} | 名称:{member_name} | 群身份:{group_role} | 关系:{r.relationship} | 好感度:{r.favour}"
+                            )
                     
                     if rel_rows:
                         relationship_table_str = "\n当前会话中其他已建立关系的用户:\n" + "\n".join(rel_rows)
@@ -1312,6 +1834,7 @@ class FavourManagerTool(Star):
             # ============================================================
             levels_rule = self._build_favour_levels_prompt(current_favour=current_favour)
             exclusive_db_text = exclusive_prompt_addon if exclusive_prompt_addon else "无"
+            group_identity_context = self._build_group_identity_context(event, user_id)
 
             rel_context = ""
             if relationship_table_str:
@@ -1434,6 +1957,7 @@ class FavourManagerTool(Star):
         <CurrentFavour>{current_favour}</CurrentFavour>
         <MaxFavour>{self.max_favour_value}</MaxFavour>
         <CurrentRelationship>{current_relationship}</CurrentRelationship>
+{group_identity_context}
         <ExistingExclusiveRelationships>{exclusive_db_text}</ExistingExclusiveRelationships>{rel_context}
     </UserContext>
     <CurrentLevelRule>{levels_rule}</CurrentLevelRule>
@@ -1943,6 +2467,60 @@ class FavourManagerTool(Star):
             logger.error(f"解除关系失败: {e}")
             yield event.plain_result("解除失败，请检查日志。")
 
+    @filter.command("更新群成员信息", alias={'刷新群成员信息', '更新群成员目录', '刷新群成员目录', '更新群身份', '刷新群身份'})
+    async def refresh_group_member_info(self, event: AstrMessageEvent):
+        """重新拉取当前群成员目录、群名片和群身份。"""
+        if not _is_group_event(event):
+            yield event.plain_result("此指令只能在群聊中使用。")
+            return
+        if not await self._check_permission(event, PermLevel.ADMIN):
+            yield event.plain_result("权限不足！需要管理员及以上权限。")
+            return
+        self._touch_group_identity(event)
+        group_id = self._group_identity_scope_id(event)
+        group = self.group_identity_store.groups.get(group_id)
+        count = await self._refresh_group_directory(event, force=True, group_id=group_id, allow_event_fallback=False)
+        group_name = group.name if group else self._session_label(event)
+        if count > 0:
+            yield event.plain_result(f"✅ 已更新群成员信息：{count} 人。\n群：{group_name} ({group_id})")
+        else:
+            yield event.plain_result("未能从平台接口获取群成员信息。请确认当前适配器支持 get_group_member_list，或稍后再试。")
+
+    @filter.command("修改群成员身份", alias={'设置群成员身份', '更新群成员身份', '修改群身份', '设置群身份'})
+    async def update_group_member_role(self, event: AstrMessageEvent, target: str, role: str):
+        """手动修正群成员身份: /修改群成员身份 @用户 owner|admin|member。"""
+        if not _is_group_event(event):
+            yield event.plain_result("此指令只能在群聊中使用。")
+            return
+        if not await self._check_permission(event, PermLevel.ADMIN):
+            yield event.plain_result("权限不足！需要管理员及以上权限。")
+            return
+        normalized_role = normalize_role(role)
+        if normalized_role not in {"owner", "admin", "member"}:
+            yield event.plain_result("身份只能是 owner / admin / member（也可用 群主 / 管理员 / 成员）。")
+            return
+        self._touch_group_identity(event)
+        uid = self._get_target_uid(event, target)
+        if not uid:
+            yield event.plain_result("未找到用户，请使用 @、用户ID、群名片或 QQ 昵称。")
+            return
+        group_id = self._group_identity_scope_id(event)
+        display_name = await self._get_user_display_name(event, uid)
+        member = self.group_identity_store.get_member(group_id, uid)
+        if not member:
+            member = self.group_identity_store.upsert_group_member(
+                group_id=group_id,
+                user_id=uid,
+                display_name=display_name,
+                role=normalized_role,
+                source="manual",
+            )
+        else:
+            member = self.group_identity_store.update_group_member_role(group_id, uid, normalized_role, source="manual")
+        if normalized_role == "owner":
+            self.group_identity_store.set_group_owner(group_id, uid, display_name, "manual role command")
+        yield event.plain_result(f"已将 {display_name or uid}({uid}) 的群身份更新为 {member.role}。")
+
     @filter.command("全局修改好感度")
     async def global_modify_favour(self, event: AstrMessageEvent, target: str, value: int):
         """全局修改好感度 (Bot管理员)"""
@@ -2265,6 +2843,11 @@ class FavourManagerTool(Star):
             msg.append("- 解除关系 @用户")
             msg.append("- 清空好感度 @用户")
             msg.append("- 清空当前好感度")
+
+        if is_admin or is_superuser:
+            msg.append("\n[群身份命令]")
+            msg.append("- 更新群成员信息")
+            msg.append("- 修改群成员身份 @用户 <owner/admin/member>")
             
         if is_superuser:
             msg.append("\n[Bot管理员命令]")
@@ -2314,5 +2897,11 @@ class FavourManagerTool(Star):
 
 6. 跨会话修改 (Bot管理员)
    示例: /跨会话修改 group:123456 修改好感度 10001 50
+
+7. 群身份信息 (管理员)
+   用法: /更新群成员信息
+   说明: 重新拉取当前群成员目录、群名片、QQ昵称和群身份。
+   用法: /修改群成员身份 @用户 owner
+   说明: 手动修正成员群身份，可填 owner/admin/member。
 """
         yield event.plain_result(msg)

@@ -122,6 +122,35 @@
       }
     }
   },
+  "group_identity": {
+    "description": "【旧版迁移兼容】群身份与成员目录 — 此页面仅供迁移数据，修改无效",
+    "type": "object",
+    "hint": "⚠️ 实际配置请前往 Pages 配置中心；这里用于首次安装/迁移。",
+    "items": {
+      "enabled": {
+        "description": "启用群身份上下文注入",
+        "type": "bool",
+        "default": true
+      },
+      "auto_fetch_member_directory": {
+        "description": "新群首次触达时自动获取群成员列表",
+        "type": "bool",
+        "default": true
+      },
+      "member_name_preference": {
+        "description": "召回名称优先级",
+        "type": "string",
+        "default": "card",
+        "options": ["card", "nickname"],
+        "hint": "card=群名片优先；nickname=QQ昵称优先。"
+      },
+      "bot_self_user_id": {
+        "description": "机器人账号ID（留空自动识别）",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
   "cold_violence_config": {
     "description": "【旧版迁移兼容】冷暴力配置 — 此页面仅供迁移数据，修改无效",
     "type": "object",
