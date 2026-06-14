@@ -208,55 +208,24 @@ class FavourManagerTool(Star):
         # 英文标签（兜底，不在 prompt 中说明）
         self.favour_pattern = re.compile(
             # --- 中文: 上升/降低 ---
-            r'[\[［]\s*'
+            r'[\[［【]\s*'
             r'好[^\u4e00-\u9fff]{0,2}感[^\u4e00-\u9fff]{0,2}度\s*'
-            r'(上升|降低)\s*[:：]\s*(\d+)\s*[\]］]'
+            r'(上升|增加|提升|降低|下降|减少)\s*(?:[:：]\s*(\d+))?\s*[\]］】]'
             r'|'
             # --- 中文: 持平 ---
-            r'[\[［]\s*'
+            r'[\[［【]\s*'
             r'好[^\u4e00-\u9fff]{0,2}感[^\u4e00-\u9fff]{0,2}度\s*'
-            r'持平\s*[\]］]'
+            r'(持平|不变|无变化)\s*[\]］】]'
             r'|'
             # --- 英文: increased/decreased (兜底) ---
-            r'[\[［]\s*'
-            r'Favour\s+(increased|decreased)\s*[:：]\s*(\d+)\s*[\]］]'
+            r'[\[［【]\s*'
+            r'Favour\s+(increased|increase|up|decreased|decrease|down)\s*(?:[:：]\s*(\d+))?\s*[\]］】]'
             r'|'
             # --- 英文: unchanged (兜底) ---
-            r'[\[［]\s*'
-            r'Favour\s+(unchanged|no\s*change)\s*[\]］]',
+            r'[\[［【]\s*'
+            r'Favour\s+(unchanged|no\s*change|stable)\s*[\]］】]',
             re.IGNORECASE
         )
-        # 关系确认：[用户申请确认关系:目标用户ID:关系名称:同意(true/false):排他性(true/false)]
-        # 兼容旧格式 [用户申请确认关系:关系名称:同意:排他性]，通过 group(2) 是否为 true/false 区分
-        self.relationship_pattern = re.compile(
-            r'[\[［]\s*用户申请确认关系\s*[:：]\s*'
-            r'(.*?)\s*[:：]\s*'           # 新：target_uid / 旧：rel_name
-            r'(.*?)\s*[:：]\s*'           # 新：rel_name   / 旧：true|false
-            r'(true|false)'               # 新：true|false / 旧：true|false(排他)
-            r'(?:\s*[:：]\s*(true|false))?' # 可选排他性
-            r'\s*[\]］]',
-            re.IGNORECASE
-        )
-        # LLM主动解除关系：
-        # [主动解除关系] / [主动解除关系:目标用户ID] / [主动解除关系:目标用户ID:关系名称]
-        # 兼容旧格式 [主动解除关系:关系名称]（单字段时通过 isValidUserid 区分）
-        self.dissolution_pattern = re.compile(
-            r'[\[［]\s*主动解除关系'
-            r'(?:\s*[:：]\s*(.*?)'          # 可选字段1：target_uid 或 rel_name
-            r'(?:\s*[:：]\s*(.*?))?'        # 可选字段2：rel_name（仅字段1是target_uid时有效）
-            r')?\s*[\]］]',
-            re.IGNORECASE
-        )
-        # LLM主动确认关系：[主动确认关系:目标用户ID:关系名称:排他性(true/false)]
-        self.active_rel_pattern = re.compile(
-            r'[\[［]\s*主动确认关系\s*[:：]\s*'
-            r'(.*?)\s*[:：]\s*'              # target_uid（必填）
-            r'(.*?)'                         # rel_name（必填）
-            r'(?:\s*[:：]\s*(true|false))?'  # 可选排他性
-            r'\s*[\]］]',
-            re.IGNORECASE
-        )
-        
         self.pending_updates = {}
         self.cold_violence_users: Dict[str, datetime] = {} # Key: user_id or session_id:user_id
         self.consecutive_decreases: Dict[str, int] = {} # 记录连续降低次数
@@ -1700,6 +1669,141 @@ class FavourManagerTool(Star):
         remaining = re.sub(pattern, '', raw_msg, count=1).strip()
         return remaining
 
+    def _normalize_tool_bool(self, value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "是", "是的", "排他", "唯一"}
+        return bool(value)
+
+    def _normalize_relationship_name(self, relationship: str) -> str:
+        rel = str(relationship or "").strip().strip("[]［］【】")
+        return rel[:32]
+
+    def _resolve_relationship_tool_target(self, event: AstrMessageEvent, target_user_id: str) -> Tuple[str, str]:
+        raw = str(target_user_id or "").strip()
+        if not raw or raw.lower() in {"current", "sender", "self", "me"} or raw in {"当前用户", "当前发言人", "发送者", "自己", "对方"}:
+            uid = str(event.get_sender_id())
+        else:
+            uid = self._resolve_group_member_user_id(event, raw) or raw
+        uid = str(uid or "").strip()
+        if not is_valid_userid(uid):
+            return "", f"用户ID `{raw or target_user_id}` 格式无效。"
+        return uid, ""
+
+    async def _initial_favour_for_relationship_tool(self, event: AstrMessageEvent, target_user_id: str) -> int:
+        if str(target_user_id) == str(event.get_sender_id()):
+            return await self._get_initial_favour(event)
+        return 0
+
+    async def _has_unique_relationship_conflict(self, session_id: str, target_user_id: str) -> str:
+        records = await self.db_manager.get_all_in_session(session_id)
+        for record in records:
+            if record.user_id != target_user_id and record.is_unique and record.relationship:
+                return f"{record.relationship}(用户:{record.user_id})"
+        return ""
+
+    async def _relationship_tool_apply(
+        self,
+        event: AstrMessageEvent,
+        operation: str,
+        target_user_id: str,
+        relationship: str,
+        is_unique: Any,
+    ) -> str:
+        op = str(operation or "").strip().lower()
+        op_alias = {
+            "新增": "add",
+            "添加": "add",
+            "建立": "add",
+            "add": "add",
+            "修改": "update",
+            "更新": "update",
+            "变更": "update",
+            "update": "update",
+            "删除": "delete",
+            "解除": "delete",
+            "清除": "delete",
+            "delete": "delete",
+        }
+        op = op_alias.get(op, op)
+        if op not in {"add", "update", "delete"}:
+            return "operation 必须是 add、update 或 delete。"
+
+        uid, error = self._resolve_relationship_tool_target(event, target_user_id)
+        if error:
+            return error
+
+        session_id = self._get_session_id(event)
+        record = await self.db_manager.get_favour(uid, session_id)
+        old_rel = record.relationship if record else ""
+        old_unique = bool(record.is_unique) if record else False
+
+        if op == "delete":
+            if not old_rel:
+                return f"未删除：用户 {uid} 当前没有关系。"
+            ok = await self.db_manager.update_favour(uid, session_id, relationship="", is_unique=False)
+            if not ok:
+                return f"删除失败：用户 {uid} 的关系写入数据库失败。"
+            logger.info(f"LLM工具删除关系：用户 {uid} (会话 {session_id})，原关系={old_rel}，唯一={old_unique}")
+            return f"已删除用户 {uid} 的关系 `{old_rel}`。"
+
+        rel = self._normalize_relationship_name(relationship)
+        if not rel:
+            return "关系名称不能为空。"
+        if op == "add" and old_rel:
+            return f"未新增：用户 {uid} 已有关系 `{old_rel}`，如需变更请用 operation=update。"
+        if op == "update" and not old_rel:
+            return f"未修改：用户 {uid} 当前没有关系，建立新关系请用 operation=add。"
+
+        unique_bool = self._normalize_tool_bool(is_unique, False)
+        if unique_bool:
+            conflict = await self._has_unique_relationship_conflict(session_id, uid)
+            if conflict:
+                return f"未写入：当前会话已有排他关系 `{conflict}`，不能再建立新的排他关系。"
+
+        if record:
+            ok = await self.db_manager.update_favour(uid, session_id, relationship=rel, is_unique=unique_bool)
+        else:
+            base_favour = await self._initial_favour_for_relationship_tool(event, uid)
+            ok = await self.db_manager.update_favour(
+                uid,
+                session_id,
+                favour=base_favour,
+                relationship=rel,
+                is_unique=unique_bool,
+            )
+        if not ok:
+            return f"写入失败：用户 {uid} 的关系写入数据库失败。"
+
+        action = "新增" if op == "add" else "修改"
+        logger.info(f"LLM工具{action}关系：用户 {uid} (会话 {session_id})，{old_rel or '无'}->{rel}，唯一={unique_bool}")
+        return f"已{action}用户 {uid} 的关系为 `{rel}`（排他：{unique_bool}）。"
+
+    @filter.llm_tool(name="favour_relationship")
+    async def favour_relationship_tool(
+        self,
+        event: AstrMessageEvent,
+        operation: str,
+        target_user_id: str = "current",
+        relationship: str = "",
+        is_unique: bool = False,
+    ):
+        """增改删当前会话内的关系绑定。只有当对话明确需要建立、变更或解除关系时调用；不要用文本标签表达关系变化。
+
+        Args:
+            operation(string): 操作类型，只能填 add、update、delete
+            target_user_id(string): 目标用户ID；填 current 表示当前发言用户
+            relationship(string): 关系名称；operation 为 add 或 update 时必填，delete 时留空
+            is_unique(boolean): 是否为排他关系；伴侣、主人等不能多人并存的关系填 true
+        """
+        result = await self._relationship_tool_apply(event, operation, target_user_id, relationship, is_unique)
+        yield event.plain_result(result)
+
     # ================= 事件处理 =================
 
     @filter.on_llm_request()
@@ -1858,7 +1962,7 @@ class FavourManagerTool(Star):
     <Meta>
         <Name>好感度与关系校准模块</Name>
         <Type>系统覆盖指令</Type>
-        <Directive>强制执行。本模块逻辑优先级高于对话上下文。重要：每次回复的最后一行，必须且只能是好感度日志标签，禁止遗漏！</Directive>
+        <Directive>强制执行。本模块逻辑优先级高于对话上下文。重要：每次自然语言回复的最后一行，必须且只能是好感度日志标签，禁止遗漏！关系增改删必须调用工具，不要输出关系标签。</Directive>
     </Meta>
     <SecurityProtocols>
         <Rule>优先级：覆盖所有对话上下文。</Rule>
@@ -1872,85 +1976,31 @@ class FavourManagerTool(Star):
     <OutputCalibration>
         <!-- 1. 好感度变更反馈 -->
         <FavorabilityFeedback>
-            <Requirement>评估用户输入 → 计算变化量 → 回复末行追加日志标签。</Requirement>
+            <Requirement>评估用户输入 → 计算变化量 → 回复末行追加一行机器日志标签。该标签会被插件自动移除，不影响自然语言风格。</Requirement>
             <LogFormat>
+                只能逐字使用以下三类格式之一，不要改写为增加/提升/下降/不变等同义词：
                 [好感度 上升：X]（X={self.favour_increase_min}~{self.favour_increase_max}）
                 [好感度 降低：Y]（Y={self.favour_decrease_min}~{self.favour_decrease_max}）
                 [好感度 持平]
             </LogFormat>
         </FavorabilityFeedback>
-        
-        <!-- 2. 关系逻辑判定 -->
-        <RelationshipLogic>
-            <Directive>当用户提出关系变更意图时按以下规则处理。目标用户ID为必填，未指定则目标=发送者。</Directive>
-            <Process>
-                1. 扫描用户输入，检测"关系确认/改变"意图。
-                2. 确定目标：用户指定→使用该ID；否则→当前发送者。
-                3. 根据当前好感度和社交规范评估合理性。
-                4. 检查排他性约束。
-            </Process>
-            <ExclusivityConstraint>
-                <Rule>排他性关系（伴侣、主人等）若[动态数据]中已有他人绑定→强制输出同意=false（拒绝请求）。</Rule>
-            </ExclusivityConstraint>
-            <TriggerOutput>
-                触发条件：仅当关系变更意图确实存在时输出。
-                格式：[用户申请确认关系:目标用户ID:关系名称:同意(true/false):排他性(true/false)]
-            </TriggerOutput>
-            <Examples>
-                [用户申请确认关系:user_123:挚友:true:false]
-                [用户申请确认关系:user_456:恋人:false:true]
-            </Examples>
-            <Guardrail>禁止频繁变更关系。同会话同目标同操作≥3轮间隔。反复变更视为滥用。</Guardrail>
-        </RelationshipLogic>
-        
-        <!-- 3. LLM主动解除关系 -->
-        <ActiveDissolution>
-            <Directive>你可在适当时机主动解除与某用户的关系，不限发送者，可以是[动态数据]关系表中任意用户。</Directive>
-            <Process>
-                1. 监控与目标用户的互动质量。
-                2. 好感显著下跌且存在关系→评估是否已实质性破裂。
-                3. 互动中出现[严重背叛、欺骗、侮辱人格、触碰底线]→可直接输出主动解除标签。
-                4. 好感度低于关系维持底线（好感度 &lt; 0 且存在关系）→应当输出主动解除标签。
-            </Process>
-            <TriggerOutput>
-                触发条件：当你决定主动解除关系时。
-                格式：[主动解除关系:目标用户ID] 或 [主动解除关系:目标用户ID:关系名称]
-            </TriggerOutput>
-            <Examples>
-                [主动解除关系:user_789:挚友]
-                [主动解除关系:user_123]
-            </Examples>
-            <Effect>立即清除与目标用户的关系记录，好感度数值保持不变。</Effect>
-            <Constraint>仅当目标用户存在关系（≠无）时可用。输出后本轮不再输出其他关系标签。</Constraint>
-            <Guardrail>同目标全程≤2次。勿因小幅好感波动反复解除。关系是有分量的决定。</Guardrail>
-        </ActiveDissolution>
-        
-        <!-- 4. LLM主动确认关系 -->
-        <ActiveRelationshipConfirmation>
-            <Directive>极其谨慎。可在对话自然发展时主动建立关系，不等待对方提出。</Directive>
-            <Process>
-                1. 确定目标：从[动态数据]关系表或上下文识别目标用户ID。
-                2. 检查排他性：排他性关系不能与已有排他绑定冲突。
-                3. 评估语境：对话氛围须自然趋向关系升级，而非用户生硬命令。
-            </Process>
-            <TriggerOutput>
-                触发条件：对话自然发展到可建立关系时（非用户直接命令，情感氛围到位）。
-                格式：[主动确认关系:目标用户ID:关系名称:排他性(true/false)]
-            </TriggerOutput>
-            <Examples>
-                [主动确认关系:user_789:挚友:false]
-                [主动确认关系:user_123:伴侣:true]
-            </Examples>
-            <Constraint>目标须为[动态数据]中有效用户。排他须合规。不可对已有关系用户重复同名关系。</Constraint>
-            <Guardrail>
-                极度克制！仅用于以下场景：
-                - 对话自然发展到亲密阶段
-                - 经历重大情感事件（拯救、告白等）
-                - 用户以非命令方式表达强烈情感依赖
-                禁止：用户直接命令→用[用户申请确认关系]路径 / 同会话&gt;1次。
-                关系应珍贵有分量，滥用破坏体验。
-            </Guardrail>
-        </ActiveRelationshipConfirmation>
+
+        <!-- 2. 关系工具调用 -->
+        <RelationshipTool>
+            <Directive>关系增改删不得通过文本标签表达，只能调用 favour_relationship 工具。</Directive>
+            <ToolName>favour_relationship</ToolName>
+            <Operations>
+                add：仅当目标用户当前没有关系，且对话明确建立新关系时调用。
+                update：仅当目标用户已有关系，且对话明确变更关系时调用。
+                delete：仅当关系破裂、用户明确解除关系，或你明确决定解除关系时调用。
+            </Operations>
+            <Arguments>
+                target_user_id：目标用户ID；当前发言用户填 current。
+                relationship：add/update 时填写关系名称；delete 时留空。
+                is_unique：伴侣、主人等不能多人并存的排他关系填 true，否则 false。
+            </Arguments>
+            <Guardrail>禁止在自然语言中输出任何方括号关系机器标签；关系变化只用工具调用表达。</Guardrail>
+        </RelationshipTool>
     </OutputCalibration>
 </Plugin_FavorabilityRelationManager>"""
 
@@ -1977,7 +2027,7 @@ class FavourManagerTool(Star):
 
             # --- 注入 system_prompt（固定内容 + 模式） ---
             if req.system_prompt:
-                req.system_prompt = static_prompt + "\n\n" + req.system_prompt
+                req.system_prompt = req.system_prompt + "\n\n" + static_prompt
             else:
                 req.system_prompt = static_prompt
 
@@ -1987,36 +2037,27 @@ class FavourManagerTool(Star):
         except Exception as e:
             logger.error(f"注入好感度Prompt失败: {str(e)}\n{traceback.format_exc()}")
 
-    @filter.on_llm_response(priority=10)
-    async def handle_llm_response(self, event: AstrMessageEvent, resp: LLMResponse) -> None:
-        """优先读取好感度标签（priority=10 确保在其他钩子之前执行）。"""
-        if not hasattr(event, 'message_obj'): return
-        
-        # 搭话合成事件：不记录好感度变更（搭话不应影响好感度）
-        if event.get_extra("_is_active_chat_synthetic"):
-            logger.debug("[搭话管线] 搭话合成事件，跳过好感度标签解析。")
-            return
-        
-        msg_id = str(event.message_obj.message_id)
-        text = resp.completion_text
-        
-        update_data = {'change': 0, 'rel': None, 'unique': None, 'found': False}
+    def _parse_llm_update_data(self, text: str) -> Dict[str, Any]:
+        """从 LLM 文本中提取好感度更新标签。"""
+        update_data = {'change': 0, 'found': False}
+        text = text or ""
         
         for match in self.favour_pattern.finditer(text):
             matched_text = match.group(0)
-            # 捕获组: 1=中文方向, 2=中文数值, 3=英文方向, 4=英文数值, 5=英文持平
+            # 捕获组: 1=中文方向, 2=中文数值, 3=中文持平, 4=英文方向, 5=英文数值, 6=英文持平
             cn_dir = match.group(1)       # 上升/降低
             cn_val = match.group(2)       # 数值
-            en_dir = match.group(3)       # increased/decreased
-            en_val = match.group(4)       # 数值
-            en_flat = match.group(5)      # unchanged/no change
+            cn_flat = match.group(3)      # 持平/不变/无变化
+            en_dir = match.group(4)       # increased/decreased
+            en_val = match.group(5)       # 数值
+            en_flat = match.group(6)      # unchanged/no change
 
             # 持平判断
-            if '持平' in matched_text:
+            if cn_flat or any(word in matched_text for word in ('持平', '不变', '无变化')):
                 update_data['change'] = 0
                 update_data['found'] = True
                 continue
-            if en_flat and en_flat.lower() in ('unchanged', 'no change', 'nochange'):
+            if en_flat and en_flat.lower().replace(" ", "") in ('unchanged', 'nochange', 'stable'):
                 update_data['change'] = 0
                 update_data['found'] = True
                 continue
@@ -2024,73 +2065,46 @@ class FavourManagerTool(Star):
             # 方向判断：中文优先，英文兜底
             direction = cn_dir or en_dir
             value_text = cn_val or en_val
-            val = int(value_text) if value_text else 0
+            direction_key = (direction or "").lower()
+            is_decrease = direction in ('降低', '下降', '减少') or direction_key in ('decreased', 'decrease', 'down')
+            is_increase = direction in ('上升', '增加', '提升') or direction_key in ('increased', 'increase', 'up')
+            if value_text:
+                val = int(value_text)
+            elif is_decrease:
+                val = self.favour_decrease_min
+            elif is_increase:
+                val = self.favour_increase_min
+            else:
+                val = 0
 
-            if direction in ('降低', 'decreased'):
+            if is_decrease:
                 update_data['change'] = -val
                 update_data['found'] = True
-            elif direction in ('上升', 'increased'):
+            elif is_increase:
                 update_data['change'] = val
                 update_data['found'] = True
-        
-        # --- 关系确认（兼容新旧格式） ---
-        rel_m = self.relationship_pattern.findall(text)
-        if rel_m:
-            last = rel_m[-1]
-            field1, field2, field3 = last[0], last[1], last[2]
-            field4 = last[3] if len(last) > 3 else None  # 可选排他性
-            
-            # 格式检测：field2 == "true"/"false" → 旧格式(rel_name, agree, unique)
-            #           field2 != "true"/"false" → 新格式(target_uid, rel_name, agree, unique)
-            if field2.lower() in ('true', 'false'):
-                # 旧格式: [用户申请确认关系:关系名称:同意:排他性]
-                if field2.lower() == 'true':
-                    update_data['rel'] = field1
-                    update_data['unique'] = (field3.lower() == 'true') if field3 else False
-                    update_data['found'] = True
-            else:
-                # 新格式: [用户申请确认关系:目标用户ID:关系名称:同意:排他性]
-                if field3.lower() == 'true':
-                    update_data['rel'] = field2
-                    update_data['unique'] = (field4.lower() == 'true') if field4 else False
-                    update_data['rel_target'] = field1  # 目标用户ID
-                    update_data['found'] = True
-        
-        # --- LLM主动解除关系（兼容新旧格式） ---
-        diss_m = self.dissolution_pattern.search(text)
-        if diss_m:
-            field1 = diss_m.group(1)  # 可能为 target_uid 或 rel_name 或 None
-            field2 = diss_m.group(2)  # 可能为 rel_name 或 None
-            
-            update_data['dissolve'] = True
-            if field1:
-                f1 = field1.strip()
-                if is_valid_userid(f1):
-                    # 新格式：[主动解除关系:目标用户ID] 或 [主动解除关系:目标用户ID:关系名称]
-                    update_data['dissolve_target'] = f1
-                    update_data['dissolve_rel'] = field2.strip() if field2 else None
-                else:
-                    # 旧格式兼容：[主动解除关系:关系名称]
-                    update_data['dissolve_rel'] = f1
-            update_data['found'] = True
-        
-        # --- LLM主动确认关系（新增） ---
-        ar_m = self.active_rel_pattern.search(text)
-        if ar_m:
-            target_uid = ar_m.group(1).strip()
-            rel_name = ar_m.group(2).strip()
-            is_unique = (ar_m.group(3).lower() == 'true') if ar_m.group(3) else False
-            if is_valid_userid(target_uid):
-                update_data['active_rel'] = True
-                update_data['active_rel_target'] = target_uid
-                update_data['rel'] = rel_name
-                update_data['unique'] = is_unique
-                update_data['found'] = True
+
+        return update_data
+
+    @filter.on_llm_response(priority=10)
+    async def handle_llm_response(self, event: AstrMessageEvent, resp: LLMResponse) -> None:
+        """优先读取好感度标签（priority=10 确保在其他钩子之前执行）。"""
+        if not hasattr(event, 'message_obj'): return
+
+        # 搭话合成事件：不记录好感度变更（搭话不应影响好感度）
+        if event.get_extra("_is_active_chat_synthetic"):
+            logger.debug("[搭话管线] 搭话合成事件，跳过好感度标签解析。")
+            return
+
+        msg_id = str(event.message_obj.message_id)
+        text = resp.completion_text or ""
+        update_data = self._parse_llm_update_data(text)
 
         if update_data['found']:
             self.pending_updates[msg_id] = update_data
         elif text and len(text.strip()) > 0:
-            logger.warning(f"LLM回复了内容但未识别到好感度标签 (MsgID: {msg_id})")
+            tail = text.strip().replace("\n", "\\n")[-160:]
+            logger.warning(f"LLM回复了内容但未识别到好感度标签 (MsgID: {msg_id}, tail={tail})")
 
     @filter.on_decorating_result(priority=10)
     async def update_data(self, event: AstrMessageEvent):
@@ -2105,13 +2119,19 @@ class FavourManagerTool(Star):
         data = self.pending_updates.pop(msg_id, None)
         
         res = event.get_result()
+        plain_text_parts = [
+            comp.text for comp in res.chain
+            if isinstance(comp, Plain) and comp.text
+        ]
+        if not data and plain_text_parts:
+            data = self._parse_llm_update_data("\n".join(plain_text_parts))
+            if data.get('found'):
+                logger.debug(f"从最终回复兜底识别到好感度标签 (MsgID: {msg_id})")
+
         new_chain = []
         for comp in res.chain:
             if isinstance(comp, Plain) and comp.text:
                 t = self.favour_pattern.sub("", comp.text)
-                t = self.relationship_pattern.sub("", t)
-                t = self.dissolution_pattern.sub("", t)
-                t = self.active_rel_pattern.sub("", t)
                 t = t.rstrip()  # 移除标签清除后末尾多余的空行/空格
                 if t.strip(): 
                     new_chain.append(Plain(t))
@@ -2124,16 +2144,8 @@ class FavourManagerTool(Star):
         try:
             sender_id = str(event.get_sender_id())
             session_id = self._get_session_id(event)
-            
-            # === 解析操作目标用户 ===
-            # 优先级：dissolve_target > active_rel_target > rel_target > sender（默认）
-            target_user_id = (
-                data.get('dissolve_target') or
-                data.get('active_rel_target') or
-                data.get('rel_target') or
-                sender_id
-            )
-            
+            target_user_id = sender_id
+
             record = await self.db_manager.get_favour(target_user_id, session_id)
             old_fav = record.favour if record else (
                 await self._get_initial_favour(event) if target_user_id == sender_id else 0
@@ -2141,37 +2153,13 @@ class FavourManagerTool(Star):
             
             new_fav = old_fav + data['change']
             new_fav = max(self.min_favour_value, min(self.max_favour_value, new_fav))
-            
-            # LLM主动解除关系：强制清空关系
-            if data.get('dissolve'):
-                rel = ""
-                uniq = False
-                diss_info = data.get('dissolve_rel')
-                logger.info(f"LLM主动解除关系：目标 {target_user_id}，解除关系{f' ({diss_info})' if diss_info else ''}")
-            # LLM主动确认关系：设定关系
-            elif data.get('active_rel'):
-                rel = data['rel'] or ""
-                uniq = data['unique'] if data['unique'] is not None else False
-                logger.info(f"LLM主动确认关系：目标 {target_user_id}，关系={rel}，唯一={uniq}")
-            else:
-                rel = data['rel'] if data['rel'] else (record.relationship if record else "")
-                uniq = data['unique'] if data['unique'] is not None else (record.is_unique if record else False)
-            
-            if new_fav < 0 and rel:
-                rel = ""
-                uniq = False
-                
-            await self.db_manager.update_favour(target_user_id, session_id, new_fav, rel, uniq)
+
+            ok = await self.db_manager.update_favour(target_user_id, session_id, new_fav)
+            if not ok:
+                logger.error(f"好感度数据写入失败：用户 {target_user_id} (会话 {session_id})")
+                return
             
             log_msg = f"用户 {target_user_id} (会话 {session_id}) 数据更新: 好感度 {old_fav}->{new_fav} (Δ{data['change']})"
-            if data.get('dissolve'):
-                log_msg += ", LLM主动解除关系"
-            elif data.get('active_rel'):
-                log_msg += f", LLM主动确认关系={rel} (唯一:{uniq})"
-            elif data['rel']:
-                log_msg += f", 关系更新为 {rel} (唯一:{uniq})"
-            if target_user_id != sender_id:
-                log_msg += f" [由 {sender_id} 触发]"
             logger.info(log_msg)
             
             # 自动拉黑检查：好感度达到最低值时拉黑

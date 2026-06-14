@@ -1,0 +1,4 @@
+aiofiles
+aiosqlite
+aiohttp
+sqlmodel

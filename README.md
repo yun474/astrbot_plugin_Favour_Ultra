@@ -51,7 +51,7 @@
 
 ```bash
 cd data/plugins
-git clone https://github.com/nuomicici/astrbot_plugin_Favour_Ultra
+git clone https://github.com/yun474/astrbot_plugin_Favour_Ultra
 # 重启 AstrBot 或重载插件
 ```
 
@@ -130,12 +130,10 @@ git clone https://github.com/nuomicici/astrbot_plugin_Favour_Ultra
 ### 1. 动态上下文注入 (Dynamic Context)
 插件会实时解析当前交互对象，并将状态通过 XML 节点 `<FavourDynamicContext>` 注入系统提示词。这包含了当前交互对象的 ID、管理权限、好感度数值与等级、已建立的单边/排他性关系等信息，甚至包含了对当前好感度上限的动态约束声明。系统借此引导大模型在生成回复时做出最符合当前关系阶段与身份设定的选择。
 
-### 2. 多态输出控制与隐形标签系统
-回复末尾由 LLM 根据内置的**逻辑门**（GALGAME/REALISTIC 模式）输出专属的情感或关系变动标签，插件捕捉后会自动截断并在后台记录，实现数据流转而玩家无感知：
+### 2. 多态输出控制与关系工具
+回复末尾由 LLM 根据内置的**逻辑门**（GALGAME/REALISTIC 模式）输出好感度变动标签，插件捕捉后会自动截断并在后台记录；关系增改删改为调用结构化工具，避免标签格式漂移：
 *   **基础好感波动**：`[好感度 上升：X]` / `[好感度 降低：Y]` / `[好感度 持平]`
-*   **玩家关系申请**：`[用户申请确认关系:目标用户ID:关系名称:同意(true/false):排他性(true/false)]`
-*   **主动关系确立**：`[主动确认关系:目标用户ID:关系名称:排他性(true/false)]`
-*   **主动关系解除**：`[主动解除关系:目标用户ID:关系名称]`
+*   **关系增改删**：由 LLM 调用 `favour_relationship(operation, target_user_id, relationship, is_unique)` 写入数据库，不再输出关系标签。
 
 ### 3. 智能 T2I 报表与隐私保护
 当查询多人数据（如 `查询当前好感度`）时，插件会自动调用 AstrBot 的文本转图片引擎。
